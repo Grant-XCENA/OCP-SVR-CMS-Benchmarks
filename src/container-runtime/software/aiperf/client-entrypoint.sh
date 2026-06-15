@@ -185,58 +185,96 @@ _param_for() {
     fi
 }
 
-# _scrape_metric <metrics_url> <metric_name> — return Prometheus gauge value
-_scrape_metric() {
-    local url="$1" name="$2"
-    local val
-    val=$(curl -sf "$url" 2>/dev/null \
-        | grep "^${name}" | grep -v '^#' | head -1 | awk '{print $2}') || true
-    echo "${val:-N/A}"
+# _sum_counter <metrics_text> <metric_name> — sum a Prometheus counter across ALL
+# label sets (workers/engines). Counters are token-denominated totals; one model
+# may emit several series (e.g. worker_id="0","1"). Returns a float (0 if absent).
+# Operates on a captured metrics snapshot (text), not a live curl, so that all
+# counters in one snapshot are mutually consistent.
+_sum_counter() {
+    local text="$1" name="$2"
+    # Match lines beginning with the exact metric name followed by '{' or space,
+    # skip HELP/TYPE comment lines, sum the last whitespace field.
+    printf '%s\n' "$text" \
+        | grep -E "^${name}(\{|[[:space:]])" \
+        | grep -v '^#' \
+        | awk '{ s += $NF } END { printf "%.6f", s+0 }'
 }
 
-# _get_cache_hit_rate <metrics_url> — try several vLLM prefix-cache metrics
-_get_cache_hit_rate() {
-    local url="$1"
-    local hr
-    hr=$(_scrape_metric "$url" "vllm:prefix_cache_hit_rate")
-    if [ "$hr" != "N/A" ] && [ -n "$hr" ]; then
-        echo "$hr" | awk '{printf "%.1f", $1 * 100}'; return
-    fi
-    hr=$(_scrape_metric "$url" "vllm:prefix_cache_block_hit_rate")
-    if [ "$hr" != "N/A" ] && [ -n "$hr" ]; then
-        echo "$hr" | awk '{printf "%.1f", $1 * 100}'; return
-    fi
-    local hits misses
-    hits=$(_scrape_metric "$url" "vllm:prefix_cache_queries_hit_total")
-    misses=$(_scrape_metric "$url" "vllm:prefix_cache_queries_miss_total")
-    if [ "$hits" != "N/A" ] && [ "$misses" != "N/A" ]; then
-        echo "$hits $misses" | awk '{t=$1+$2; if(t>0) printf "%.1f",$1/t*100; else print "N/A"}'
-        return
-    fi
-    echo "N/A"
+# _snapshot_metrics <metrics_url> — fetch /metrics once and echo the four prefix
+# cache counters we care about as a single line:
+#   ext_hits ext_queries l1_hits l1_queries
+# Token-denominated. Missing metric => 0. "ERR" if the endpoint is unreachable.
+_snapshot_metrics() {
+    local url="$1" text
+    text=$(curl -sf "$url" 2>/dev/null) || { echo "ERR"; return; }
+    [ -z "$text" ] && { echo "ERR"; return; }
+    local eh eq l1h l1q
+    eh=$(_sum_counter "$text" "vllm:external_prefix_cache_hits_total")
+    eq=$(_sum_counter "$text" "vllm:external_prefix_cache_queries_total")
+    l1h=$(_sum_counter "$text" "vllm:prefix_cache_hits_total")
+    l1q=$(_sum_counter "$text" "vllm:prefix_cache_queries_total")
+    echo "${eh} ${eq} ${l1h} ${l1q}"
 }
 
-# _get_gpu_utilization — nvidia-smi fallback
+# _rate_from_delta <start_hits> <start_q> <end_hits> <end_q> — percentage hit rate
+# computed from the DELTA across a level. Differencing isolates this level's
+# requests even if cache state carried over from a prior level. Returns N/A if no
+# queries occurred in the window (can't define a rate over zero traffic).
+_rate_from_delta() {
+    awk -v sh="$1" -v sq="$2" -v eh="$3" -v eq="$4" 'BEGIN {
+        dh = eh - sh; dq = eq - sq;
+        if (dq > 0) printf "%.1f", (dh / dq) * 100;
+        else print "N/A";
+    }'
+}
+
+# _get_gpu_utilization — average GPU compute utilization across all GPUs.
+# PRIMARY source: DCGM-exporter Prometheus endpoint (DCGM_FI_DEV_GPU_UTIL),
+# reachable from the client because the stack is host-networked. This works even
+# though the GPU lives in the server container — DCGM runs in its own container
+# with --gpus all and exposes util over HTTP, which any host-networked container
+# can scrape. FALLBACK: nvidia-smi, for setups without DCGM (only works if the
+# client can actually see the GPU).
+# Configurable via AIPERF_SWEEP_GPU_METRICS_URL (default http://localhost:9400/metrics).
 _get_gpu_utilization() {
+    local dcgm_url="${AIPERF_SWEEP_GPU_METRICS_URL:-http://localhost:9400/metrics}"
+    local text util
+    text=$(curl -sf "$dcgm_url" 2>/dev/null) || text=""
+    if [ -n "$text" ]; then
+        # Average DCGM_FI_DEV_GPU_UTIL across all gpu="N" label sets.
+        util=$(printf '%s\n' "$text" \
+            | grep -E '^DCGM_FI_DEV_GPU_UTIL(\{|[[:space:]])' \
+            | grep -v '^#' \
+            | awk '{ s += $NF; n++ } END { if (n>0) printf "%.1f", s/n; else print "" }')
+        if [ -n "$util" ]; then
+            echo "$util"; return
+        fi
+    fi
+    # Fallback: nvidia-smi (requires GPU visibility in this container)
     if command -v nvidia-smi &>/dev/null; then
-        nvidia-smi --query-gpu=utilization.gpu \
+        local out
+        out=$(nvidia-smi --query-gpu=utilization.gpu \
             --format=csv,noheader,nounits 2>/dev/null \
-            | awk '{sum+=$1;n++} END{if(n>0) printf "%.1f",sum/n; else print "N/A"}'
+            | awk '{sum+=$1;n++} END{if(n>0) printf "%.1f",sum/n; else print ""}')
+        echo "${out:-N/A}"
     else
         echo "N/A"
     fi
 }
 
-# _sample_metrics_bg <outfile> <metrics_url> <interval> — background sampler
-_sample_metrics_bg() {
-    local outfile="$1" url="$2" interval="$3"
-    echo "timestamp,cache_hit_pct,gpu_util_pct" > "$outfile"
+# _sample_gpu_bg <outfile> <interval> — background GPU-util sampler ONLY.
+# Cache hit rate is now measured by start/end counter deltas around the level
+# (see run loop), not by averaging instantaneous samples — counters are
+# monotonic totals, so averaging them is meaningless. GPU util, by contrast, is
+# an instantaneous gauge and is correctly captured by periodic sampling + mean.
+_sample_gpu_bg() {
+    local outfile="$1" interval="$2"
+    echo "timestamp,gpu_util_pct" > "$outfile"
     while true; do
-        local ts hit gpu
+        local ts gpu
         ts=$(date '+%s')
-        hit=$(_get_cache_hit_rate "$url")
         gpu=$(_get_gpu_utilization)
-        echo "${ts},${hit},${gpu}" >> "$outfile"
+        echo "${ts},${gpu}" >> "$outfile"
         sleep "$interval"
     done
 }
@@ -382,7 +420,7 @@ NSJSON
     # CSV header (targeted mode only)
     if [ "${SWEEP_TARGETED}" = "true" ]; then
     cat > "${SWEEP_CSV}" << 'CSVHDR'
-target_hit_pct,turn_mean,turn_stddev,concurrency,isl,osl,shared_prompt,delay_ms,conv_num,dataset_entries,actual_cache_hit_pct,gpu_util_pct,status
+target_hit_pct,turn_mean,turn_stddev,concurrency,isl,osl,shared_prompt,delay_ms,conv_num,dataset_entries,actual_cache_hit_pct,l1_cache_hit_pct,gpu_util_pct,status
 CSVHDR
 
     BENCH_EXIT=0
@@ -517,12 +555,13 @@ CSVHDR
     "conversation_num": ${S_CONV_NUM},
     "dataset_entries": ${S_DATASET_ENTRIES},
     "actual_cache_hit_pct": "DRY_RUN",
+    "l1_cache_hit_pct": "DRY_RUN",
     "gpu_util_pct": "DRY_RUN",
     "status": "dry_run"
 }
 DRYJSON
             # Write to sweep CSV
-            echo "${TARGET},${S_TURN_MEAN},${S_TURN_STDDEV},${S_CONCURRENCY},${S_ISL},${S_OSL},${S_SHARED_PROMPT},${S_TURN_DELAY},${S_CONV_NUM},${S_DATASET_ENTRIES},DRY_RUN,DRY_RUN,dry_run" \
+            echo "${TARGET},${S_TURN_MEAN},${S_TURN_STDDEV},${S_CONCURRENCY},${S_ISL},${S_OSL},${S_SHARED_PROMPT},${S_TURN_DELAY},${S_CONV_NUM},${S_DATASET_ENTRIES},DRY_RUN,DRY_RUN,DRY_RUN,dry_run" \
                 >> "${SWEEP_CSV}"
 
             # Log the full command to a file for regression test collection
@@ -537,43 +576,65 @@ DRYJSON
 
         # ----- LIVE EXECUTION -----
 
-        # Try to reset prefix cache between levels
-        curl -sf -X POST "http://localhost:30080/reset_prefix_cache" &>/dev/null || true
+        # Reset BOTH cache layers between levels so each level starts cold.
+        # VLLM_SERVER_DEV_MODE=1 exposes /reset_prefix_cache; reset_external=true
+        # also clears the LMCache/Maru tier (the external connector cache).
+        # reset_running_requests=true drops any in-flight prefix refs.
+        curl -sf -X POST \
+            "http://localhost:30080/reset_prefix_cache?reset_external=true&reset_running_requests=true" \
+            &>/dev/null || cms_log_warn "  reset_prefix_cache call failed (dev mode off?)"
         sleep 2
 
-        # Start background metric sampler
-        _sample_metrics_bg "${LEVEL_METRICS}" "${SWEEP_METRICS_URL}" "${SWEEP_METRICS_INTERVAL}" &
+        # START snapshot of token-denominated cache counters (after reset).
+        START_SNAP=$(_snapshot_metrics "${SWEEP_METRICS_URL}")
+
+        # Start GPU-util sampler (instantaneous gauge -> periodic mean).
+        _sample_gpu_bg "${LEVEL_METRICS}" "${SWEEP_METRICS_INTERVAL}" &
         SAMPLER_PID=$!
 
         # Run benchmark
         LEVEL_EXIT=0
         aiperf "${LEVEL_ARGS[@]}" > "${LEVEL_DIR}/aiperf_stdout.log" 2>&1 || LEVEL_EXIT=$?
 
-        # Stop sampler
+        # Stop GPU sampler
         kill "${SAMPLER_PID}" 2>/dev/null || true
         wait "${SAMPLER_PID}" 2>/dev/null || true
+
+        # END snapshot
+        END_SNAP=$(_snapshot_metrics "${SWEEP_METRICS_URL}")
 
         if [ ${LEVEL_EXIT} -ne 0 ]; then
             cms_log_warn "Sweep level ${TARGET}% exited with code ${LEVEL_EXIT}"
             BENCH_EXIT=${LEVEL_EXIT}
         fi
 
-        # Compute average metrics from timeseries
-        local_hit="N/A"
+        # ---- Compute cache hit rates from counter deltas ----
+        # external_hit_rate = primary (LMCache/Maru tier, the cache being swept)
+        # l1_hit_rate       = secondary (vLLM GPU-resident prefix cache in front)
+        local_hit="N/A"      # primary (external)
+        local_l1_hit="N/A"   # secondary (vLLM L1)
+        if [ "${START_SNAP}" != "ERR" ] && [ "${END_SNAP}" != "ERR" ]; then
+            read -r s_eh s_eq s_l1h s_l1q <<< "${START_SNAP}"
+            read -r e_eh e_eq e_l1h e_l1q <<< "${END_SNAP}"
+            local_hit=$(_rate_from_delta "${s_eh}" "${s_eq}" "${e_eh}" "${e_eq}")
+            local_l1_hit=$(_rate_from_delta "${s_l1h}" "${s_l1q}" "${e_l1h}" "${e_l1q}")
+        else
+            cms_log_warn "  Metrics endpoint unreachable; cache hit rate = N/A"
+        fi
+
+        # ---- Average GPU utilization from sampler ----
         local_gpu="N/A"
         if [ -f "${LEVEL_METRICS}" ] && [ "$(wc -l < "${LEVEL_METRICS}")" -gt 2 ]; then
-            local_hit=$(tail -n +2 "${LEVEL_METRICS}" | awk -F',' '
-                $2 != "N/A" {sum+=$2; n++} END {if(n>0) printf "%.1f",sum/n; else print "N/A"}
-            ')
             local_gpu=$(tail -n +2 "${LEVEL_METRICS}" | awk -F',' '
-                $3 != "N/A" {sum+=$3; n++} END {if(n>0) printf "%.1f",sum/n; else print "N/A"}
+                $2 != "N/A" && $2 != "" {sum+=$2; n++}
+                END {if(n>0) printf "%.1f",sum/n; else print "N/A"}
             ')
         fi
 
         local_status="success"
         [ ${LEVEL_EXIT} -ne 0 ] && local_status="failed"
 
-        cms_log_info "  Actual cache hit: ${local_hit}%  GPU util: ${local_gpu}%"
+        cms_log_info "  Cache hit (external/Maru): ${local_hit}%  |  vLLM L1: ${local_l1_hit}%  |  GPU util: ${local_gpu}%"
 
         # GPU floor check
         if [ "${local_gpu}" != "N/A" ]; then
@@ -583,8 +644,8 @@ DRYJSON
             fi
         fi
 
-        # Append to sweep CSV
-        echo "${TARGET},${S_TURN_MEAN},${S_TURN_STDDEV},${S_CONCURRENCY},${S_ISL},${S_OSL},${S_SHARED_PROMPT},${S_TURN_DELAY},${S_CONV_NUM},${S_DATASET_ENTRIES},${local_hit},${local_gpu},${local_status}" \
+        # Append to sweep CSV (note added l1_hit column)
+        echo "${TARGET},${S_TURN_MEAN},${S_TURN_STDDEV},${S_CONCURRENCY},${S_ISL},${S_OSL},${S_SHARED_PROMPT},${S_TURN_DELAY},${S_CONV_NUM},${S_DATASET_ENTRIES},${local_hit},${local_l1_hit},${local_gpu},${local_status}" \
             >> "${SWEEP_CSV}"
 
         # Write per-level metadata JSON (for parse_results.py)
@@ -602,6 +663,7 @@ DRYJSON
     "conversation_num": ${S_CONV_NUM},
     "dataset_entries": ${S_DATASET_ENTRIES},
     "actual_cache_hit_pct": "${local_hit}",
+    "l1_cache_hit_pct": "${local_l1_hit}",
     "gpu_util_pct": "${local_gpu}",
     "status": "${local_status}"
 }

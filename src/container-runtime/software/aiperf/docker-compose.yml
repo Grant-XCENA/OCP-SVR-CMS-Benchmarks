@@ -45,8 +45,11 @@ services:
     # devices:
     #   - /dev/dax0.0:/dev/dax0.0
     #   - /dev/dax12.0:/dev/dax12.0
+    # Not every container runtime likes this env variable and 
+    # the health check will fail. If you need maru to run on 
+    # _not_ 5555 then update this manually. 
     healthcheck:
-      test: ["CMD", "bash", "-c", "echo > /dev/tcp/127.0.0.1/${LMCACHE_MARU_PORT:-5555}"]
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/127.0.0.1/5555"]
       interval: 10s
       timeout: 5s
       retries: 30
@@ -104,6 +107,38 @@ services:
     depends_on:
       lmcache-server-gpu:
         condition: service_healthy
+      dcgm-exporter:
+        condition: service_started
     volumes:
       - ${HOST_RESULTS_DIR:-./results}:/opt/aiperf-bench/container_results
     env_file: .env
+
+  # ---------------------------------------------------------------------------
+  # DCGM Exporter: GPU telemetry for the sweep's GPU-util measurement.
+  #   Exposes DCGM_FI_DEV_GPU_UTIL (and others) on :9400 in Prometheus format.
+  #   The client scrapes this over host networking — it works even though the
+  #   GPU is used by the server container, because DCGM has its own --gpus all.
+  #   The custom metrics CSV is required: GPU_UTIL is NOT in the default set.
+  # ---------------------------------------------------------------------------
+  dcgm-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.6.0-ubuntu22.04
+    container_name: ocp-cms-aiperf-dcgm
+    network_mode: host
+    cap_add:
+      - SYS_ADMIN
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility]
+    volumes:
+      - ./dcgm-metrics.csv:/etc/dcgm-exporter/custom-metrics.csv:ro
+    command: ["-f", "/etc/dcgm-exporter/custom-metrics.csv", "-a", ":9400"]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/127.0.0.1/9400"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s

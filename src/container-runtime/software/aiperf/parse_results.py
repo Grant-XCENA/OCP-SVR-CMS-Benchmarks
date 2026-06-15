@@ -24,6 +24,7 @@ import csv
 import glob
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -71,9 +72,30 @@ def _parse_aiperf_json(json_path):
     with open(json_path) as f:
         data = json.load(f)
 
-    # Extract input config for metadata
+    # Extract input config for metadata. AIPerf's schema has shifted the model
+    # field across versions, so check several plausible locations before giving
+    # up. Final fallback: parse it from the artifact directory name, which AIPerf
+    # builds as "<model>-<endpoint>-<mode>N" (slashes in model -> underscores).
     config = data.get("input_config", {})
-    model = config.get("model", "unknown")
+    model = (
+        config.get("model")
+        or config.get("model_name")
+        or config.get("model_names", [None])[0] if isinstance(config.get("model_names"), list) else None
+    )
+    if not model:
+        # Some schemas nest under endpoint/ or put a list at top level
+        endpoint_cfg = config.get("endpoint", {}) if isinstance(config.get("endpoint"), dict) else {}
+        model = endpoint_cfg.get("model_name") or data.get("model") or data.get("model_name")
+    if not model:
+        # Fallback: derive from the run directory name (…/<model>-<endpoint>-<mode>N/)
+        run_dir = os.path.basename(os.path.dirname(json_path))
+        # strip trailing "-<endpoint>-<mode>N" heuristically; keep leading model token
+        # e.g. "Qwen_Qwen3-32B-chat-concurrency3" -> "Qwen/Qwen3-32B"
+        m = re.match(r"^(.*?)-(chat|completions|embeddings|rankings|template)\b", run_dir)
+        if m:
+            model = m.group(1).replace("_", "/", 1)
+        else:
+            model = run_dir or "unknown"
     endpoint_type = config.get("endpoint_type", "unknown")
 
     # Timing
@@ -324,6 +346,7 @@ def parse_aiperf_results(results_dir, suite_name):
                 record["sweep_mode"] = True
                 record["target_cache_hit_pct"] = sweep_info.get("target_cache_hit_pct")
                 record["actual_cache_hit_pct"] = sweep_info.get("actual_cache_hit_pct")
+                record["l1_cache_hit_pct"] = sweep_info.get("l1_cache_hit_pct")
                 record["gpu_util_pct"] = sweep_info.get("gpu_util_pct")
                 record["sweep_turn_mean"] = sweep_info.get("turn_mean")
                 record["sweep_turn_delay_ms"] = sweep_info.get("turn_delay_ms")
@@ -410,7 +433,8 @@ def parse_aiperf_results(results_dir, suite_name):
         ]
         if has_sweep:
             fieldnames.extend([
-                "Target Cache Hit %", "Actual Cache Hit %", "GPU Util %",
+                "Target Cache Hit %", "Actual Cache Hit % (external/Maru)",
+                "vLLM L1 Cache Hit %", "GPU Util %",
                 "Sweep Turn Mean", "Sweep Delay (ms)", "Sweep Shared Prompt",
             ])
         with open(csv_path, "w", newline="") as f:
@@ -442,7 +466,8 @@ def parse_aiperf_results(results_dir, suite_name):
                 if has_sweep:
                     row.update({
                         "Target Cache Hit %": r.get("target_cache_hit_pct", ""),
-                        "Actual Cache Hit %": r.get("actual_cache_hit_pct", ""),
+                        "Actual Cache Hit % (external/Maru)": r.get("actual_cache_hit_pct", ""),
+                        "vLLM L1 Cache Hit %": r.get("l1_cache_hit_pct", ""),
                         "GPU Util %": r.get("gpu_util_pct", ""),
                         "Sweep Turn Mean": r.get("sweep_turn_mean", ""),
                         "Sweep Delay (ms)": r.get("sweep_turn_delay_ms", ""),

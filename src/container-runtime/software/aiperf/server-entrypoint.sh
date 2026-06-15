@@ -99,6 +99,10 @@ export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
 # -------------------------------------------------------------------------
 export LMCACHE_USE_EXPERIMENTAL=True
 
+export PROMETHEUS_MULTIPROC_DIR="${PROMETHEUS_MULTIPROC_DIR:-/tmp/lmcache_prometheus}"
+rm -rf "${PROMETHEUS_MULTIPROC_DIR}"
+mkdir -p "${PROMETHEUS_MULTIPROC_DIR}"
+
 VLLM_ARGS=(serve "${MODEL}" --port "${PORT}" --max-model-len "${MAX_LEN}")
 VLLM_ARGS+=(--gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.8}")
 
